@@ -1,36 +1,19 @@
 #include <Wire.h>
-#include <math.h>
 
-//Gyroscope library
-#include <Adafruit_ICM20X.h>
-#include <Adafruit_ICM20948.h>
+//David's IMU library----------------------------------
 #include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <math.h>
 
 //Altimeter library-------------------------------------
 #include <SparkFunMPL3115A2.h>
 
-//Transmission library------------------------------
-#include <SPI.h>
-#include <RH_RF95.h>
+//Stat library---------------------------------------
+#include "Statistic.h"
 
-//Gyroscope object instance
-Adafruit_ICM20948 icm;
-
-//Altimeter object instance
+//Altimeter object instance-----------------------------
 MPL3115A2 alt;
 double currAlt;
-double initialAlt;
-
-// For SPI mode, we need a CS/SCK/MOSI/MISO pins
-#define ICM_CS 10 // CS
-#define ICM_SCK 13  //SCL
-#define ICM_MISO 12 //SDO
-#define ICM_MOSI 11 //SDA
-
-//Transmission pinout-----------------------
-#define RFM95_CS 0
-#define RFM95_RST 3
-#define RFM95_INT 2
 
 //SD Card configuration----------------------------------------
 #include <SD.h>
@@ -38,151 +21,70 @@ File myFlightData;
 const int chipSelect = BUILTIN_SDCARD;
 boolean fileNotCreated = true;
 int fileNum = 1;
+byte *buffer;
 
-
-//Transreceiver
-// Change to 434.0 or other frequency, must match RX's freq!
-#define RF95_FREQ 850.0
-
-// Singleton instance of the radio driver
-RH_RF95 rf95(RFM95_CS, RFM95_INT);
-
-char radiopacket[20] = "Landed";
-
-// IMU setting ---------------------------------------------
+// David' IMU-------------------------------------------------------
+/* The #define: Millisecond delay before getting data, aka how fast void loop() runs
+ *  The Adafruit: Initializing sensor with IMU Address for I2C
+ *  The 2 Booleans: for when we have sensed the rocket has launched or settled (not moving on the ground)
+ */
+#define BNO055_SAMPLERATE_DELAY_MS (1000)
+Adafruit_BNO055 BNO = Adafruit_BNO055(1, 0x28);
 bool settled = false;
 bool launched = false;
+/* Constants: g is gravity (m/s^2)
+ *  launchForceMultiplier changes how large of a magnitude of acceleration must be felt to trigger launched (higher means more force is needed to trigger launch)
+ *  margin is the percent of gravity which is +/- to g to make a range of acceptable values for whther the rocket has settled, thus should be close to 9.81 
+ *  valuesRecorded is the size of the array of recorded accelerometer and altimeter values 
+ *  pastAccelerations[valuesRecorded] is an array of the most recent magnitude-of-acceleration values
+ *  accelLandingDelay is when after launching, how much time is between each read of acceleration
+ *  recordedTime will be initialized to record a certain time which will be used to  see whether a certain amount of time has passed.
+*/
 float g = 9.81;
-float launchForceMultiplier = 4;
-float margin = 0.05;
-const int valuesRecorded = 3;
-double pastAccelerations[valuesRecorded] = {-1.0};
-unsigned long startTime;
+float launchForceMultiplier = 5;
+const int valuesRecorded = 5;
+double pastAccelerations[valuesRecorded];
+double pastGyroscopes[valuesRecorded];
+double pastAltitudes[valuesRecorded];
+int accelLandingDelay = 5000;
+unsigned long recordedTime;
+double magnitudeAccel;
+double magnitudeGyro;
+int accelMargin = 1;
+int gyroMargin = 1;
+int altMargin = 2;
+
+//Statistics
+Statistic accelStat;
+Statistic gyroStat;
+double accelStd;
+double gyroStd;
 
 void setup() {
   Serial.begin(115200);
 
   Wire.begin();// Join i2c bus
-  Serial.println("Altimeter found!");
-
-  //-------------------Transmission setup--------------------------------------------------------------
-//  pinMode(RFM95_RST, OUTPUT);
-//  digitalWrite(RFM95_RST, HIGH);
-//
-//  // manual reset
-//  digitalWrite(RFM95_RST, LOW);
-//  delay(10);
-//  digitalWrite(RFM95_RST, HIGH);
-//  delay(10);
-//
-//  while (!rf95.init()) {
-//    Serial.println("LoRa radio init failed");
-//    Serial.println("Uncomment '#define SERIAL_DEBUG' in RH_RF95.cpp for detailed debug info");
-//    while (1);
-//  }
-//  
-//  if (!rf95.setFrequency(RF95_FREQ)) {
-//    Serial.println("setFrequency failed");
-//    while (1);
-//  }
-//  
-//  rf95.setTxPower(23, false);
-//
-//  char testPacket[4] = "test";
-//  
-//  rf95.send((uint8_t *)testPacket, 4);
-//  rf95.waitPacketSent();
-  
 
   //-------------------Initiate the configuration process-------------------------------------------------
   // Initializes altimeter
   alt.begin();
-  Serial.println("Altimeter started");
+//  Serial.println("Altimeter started");
   alt.setModeAltimeter(); // Measure altitude above sea level in meters
   alt.setOversampleRate(7); // Set Oversample to the recommended 128
-  alt.enableEventFlags(); // Enable all three pressure and temp event flags 
-
-  initialAlt = alt.readAltitude();
-  Serial.println(initialAlt);
-
-   // Initializes IMU sensor
-  if(!icm.begin_SPI(ICM_CS)) {
-      Serial.println("Failed to find gyroscope");
-      while (1) {
-        icm.begin_SPI(ICM_CS);
-      }
-  }
-  Serial.println("Gyroscope Found!");
-
-  // Configures IMU
-  icm.setAccelRange(ICM20948_ACCEL_RANGE_8_G);
-  Serial.print("Accelerometer range set to: ");
-  switch (icm.getAccelRange()) {
-    case ICM20948_ACCEL_RANGE_2_G:
-      Serial.println("+-2G");
-      break;
-    case ICM20948_ACCEL_RANGE_4_G:
-      Serial.println("+-4G");
-      break;
-    case ICM20948_ACCEL_RANGE_8_G:
-      Serial.println("+-8G");
-      break;
-    case ICM20948_ACCEL_RANGE_16_G:
-      Serial.println("+-16G");
-      break;
-  }
-
-  icm.setGyroRange(ICM20948_GYRO_RANGE_250_DPS);
-  Serial.print("Gyro range set to: ");
-  switch (icm.getGyroRange()) {
-    case ICM20948_GYRO_RANGE_250_DPS:
-      Serial.println("250 degrees/s");
-      break;
-    case ICM20948_GYRO_RANGE_500_DPS:
-      Serial.println("500 degrees/s");
-      break;
-    case ICM20948_GYRO_RANGE_1000_DPS:
-      Serial.println("1000 degrees/s");
-      break;
-    case ICM20948_GYRO_RANGE_2000_DPS:
-      Serial.println("2000 degrees/s");
-      break;
-  }
-
-//  icm.setAccelRateDivisor(1);
-  uint16_t accel_divisor = icm.getAccelRateDivisor();
-  float accel_rate = 1125 / (1.0 + accel_divisor);
-
-  Serial.print("Accelerometer data rate divisor set to: ");
-  Serial.println(accel_divisor);
-  Serial.print("Accelerometer data rate (Hz) is approximately: ");
-  Serial.println(accel_rate);
-
-//  icm.setGyroRateDivisor(1);
-  uint8_t gyro_divisor = icm.getGyroRateDivisor();
-  float gyro_rate = 1100 / (1.0 + gyro_divisor);
-
-  Serial.print("Gyro data rate divisor set to: ");
-  Serial.println(gyro_divisor);
-  Serial.print("Gyro data rate (Hz) is approximately: ");
-  Serial.println(gyro_rate);
-
-  icm.enableAccelDLPF(true, ICM20X_ACCEL_FREQ_11_5_HZ);
+  alt.enableEventFlags(); // Enable all three pressure and temp event flags
+  currAlt = alt.readAltitude();
 
   //----------------------SD Card initialization-----------------------------------------------------------
   // Initializes SD card reader and csv file
   if(!SD.begin(chipSelect)) {
-    Serial.println("sd init failed");
-
+//    Serial.println("sd init failed");
     while(1) {
     }
   }
 
   while (fileNotCreated) {
-    Serial.println(fileNum);
-
     String fileName = "flight"+String(fileNum)+".csv";
-    byte buffer[fileName.length() + 1];
+    buffer = new byte[fileName.length() + 1];
     fileName.toCharArray(buffer, fileName.length()+1);
     
     File entry = SD.open(buffer);
@@ -193,78 +95,117 @@ void setup() {
     }
     fileNum++;
   }
-    
-  Serial.println("Opened flight.csv");
+  delay(1000);
+//  Serial.println("Opened flight.csv");
+  myFlightData.println("Time(ms),Magnitude of Accel,Accel(X)(m/s^2),Accel(Y)(m/s^2),Accel(Z)(m/s^2),Magnitude of Gyro,Gyro(X)(rad/s),Gyro(Y)(rad/s),Gyro(Z)(rad/s),Altitude(m)\n");
 
-  // Labels columns of csv file
-  myFlightData.print("Time(ms),Accel(X)(m/s^2),Accel(Y)(m/s^2),Accel(Z)(m/s^2),Gyro(X)(rad/s),Gyro(Y)(rad/s),Gyro(Z)(rad/s),Altitude(m)\n");
+  //David's IMU setup ----------------------------------------------------------------------------------------------------------------------
+  if (!BNO.begin()) {
+//    Serial.println("Imu did not initiate");
+    while (1);
+  }
+  delay(1000);
+  BNO.setExtCrystalUse(true);
+  recordedTime=millis();
+
+  for (int i = 0; i < valuesRecorded; i++) {
+    pastAccelerations[i] = i;
+    pastGyroscopes[i] = i;
+    pastAltitudes[i] = i;
+  }
 
   //------------------------Buzzer setup------------------------------------------------------------------------------------------------
   pinMode(6, OUTPUT); // Set buzzer - pin 6 as an output
-
   tone(6, 1000); // Send 1KHz sound signal...
-  delay(2000);        // ...for 1 sec
+  delay(1000);        // ...for 1 sec
   noTone(6);     // Stop sound...
 }
  
 void loop() {
+  // Opening SD Card
+  myFlightData = SD.open(buffer,FILE_WRITE);
+
   //Altimeter reading
   currAlt = alt.readAltitude();
+  
+  //Reading accelerometer and gyroscopic data
+  imu::Vector<3> acc = BNO.getVector(Adafruit_BNO055::VECTOR_ACCELEROMETER);
+  imu::Vector<3> gyro = BNO.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
+  
+  //Disregarding direction of acceleration to find the total magnitude
+  magnitudeAccel = sqrt(pow(acc.x(),2) + pow(acc.y(),2) + pow(acc.z(),2));
+  magnitudeGyro = sqrt(pow(gyro.x(),2) + pow(gyro.y(),2) + pow(gyro.z(),2));
 
-  /* Gets a new normalized sensor event from IMU */
-  sensors_event_t accel;
-  sensors_event_t gyro;
-  sensors_event_t mag;
-  sensors_event_t temp;
-  
-  icm.getEvent(&accel, &gyro, &temp, &mag);
-  
-  myFlightData.println(String(millis()) + "," + String(accel.acceleration.x) + "," + String(accel.acceleration.y) + "," + String(accel.acceleration.z) + "," + String(gyro.gyro.x) + "," + String(gyro.gyro.y) + "," + String(gyro.gyro.z) + "," + String(alt.readAltitude()));
-  Serial.println(accel.acceleration.x);
-  double magnitude = sqrt(pow(accel.acceleration.x,2) + pow(accel.acceleration.y,2) + pow(accel.acceleration.z,2));
-  Serial.print("Mag: ");
-  Serial.println(magnitude);
-  if(magnitude >= (g*launchForceMultiplier)){
+  // print frewquency relative to void loop delay
+  myFlightData.println(String(millis()) + "," + String(magnitudeAccel) + "," + String(acc.x()) + "," + String(acc.y()) + "," + String(acc.z()) + "," + String(magnitudeGyro) + "," + String(gyro.x()) + "," + String(gyro.y()) + "," + String(gyro.z())+","+String(currAlt));
+
+  /* To keep the data in sequencial order and to standardize a process of recording
+   * Each value in the array will be shifted to the left and the new value added on to the last index
+   */
+  // Reducing false positives by creating redundency by comparing the acceleration at any instant and the change in altitude s
+  if (((magnitudeAccel >= (g*launchForceMultiplier)) || ((pastAltitudes[valuesRecorded-1]-pastAltitudes[0]) > 25)) && !launched) {
+    myFlightData.println("Launched");
     launched = true;
-    Serial.println("launched");
   }
+
   if(launched){
-    if(millis()-startTime >= 5000){
-//      Serial.println("5 sec");
-      for(int i =0; i<valuesRecorded-1; i++){
-        pastAccelerations[i]= pastAccelerations[i+1];
+    if(millis()-recordedTime >= accelLandingDelay){
+      /* Similar to the loop used for the altimeter data: standardize process of recording
+       * Each value in array shifted to the left and new value added on to the last index
+       */
+      for(int i=0; i<valuesRecorded-1; i++){
+        pastAccelerations[i] = pastAccelerations[i+1];
+        pastGyroscopes[i] = pastGyroscopes[i+1];
+        pastAltitudes[i] = pastAltitudes[i+1];
       }
-      pastAccelerations[valuesRecorded-1] = magnitude;
-//      Serial.print(" 1: ");
-//      Serial.print(pastAccelerations[0]);
-//      Serial.print(" 2: ");
-//      Serial.print(pastAccelerations[1]);
-//      Serial.print(" 3: ");
-//      Serial.println(pastAccelerations[2]);
-      startTime = millis();
-    }
-    for(int i=0; i<valuesRecorded; i++){   
-      if(((pastAccelerations[i] > ((1+margin)*g)) || (pastAccelerations[i] < ((1-margin)*g)))&&(currAlt > initialAlt)) {
-        settled=false;
-        break;
+
+      pastAccelerations[valuesRecorded-1] = magnitudeAccel;
+      pastGyroscopes[valuesRecorded-1] = magnitudeGyro;
+      pastAltitudes[valuesRecorded-1] = currAlt;
+
+//      for(int i=0; i<valuesRecorded; i++){
+//        Serial.println("i: " + String(i));
+//        Serial.println(pastAccelerations[i]);
+//      }
+
+      for (int i = 0; i < valuesRecorded; i++){
+        accelStat.add(pastAccelerations[i]);
+        gyroStat.add(pastGyroscopes[i]);
       }
-      else{
-        settled=true;
-        myFlightData.close();
+
+      accelStd = accelStat.pop_stdev();
+      gyroStd = gyroStat.pop_stdev();
+
+      myFlightData.println("Accel Std," + String(accelStd) + ",Gyro Std," + String(gyroStd));
+      
+      accelStat.clear(true);
+      gyroStat.clear(true);
+      
+      recordedTime = millis();
+    // To test whether we have actually settled on the ground we run through all the recorded data
+    // Nested if statement logic same as &&
+      for (int i = 0; i < valuesRecorded-1; i++){
+        if(abs(pastAltitudes[i]-pastAltitudes[i+1]) > altMargin || accelStd > accelMargin || gyroStd > gyroMargin) {
+          settled=false;
+          break;
+        }
+        else {
+          settled=true;
+          myFlightData.println("Landed determined time:" + String(millis()));
+          myFlightData.println("Accel Std," + String(accelStd));
+          myFlightData.println("Gyro Std," + String(gyroStd));
+        }
       }
-    }
-    if(settled){
-      while(1) {
-        //-----------------------Transmisssion--------------------------------------
-        rf95.send((uint8_t *)radiopacket, 20);
-        rf95.waitPacketSent();
-  
-        //-----------------------Beeping sound----------------------------------------
-        tone(6, 1000); // Send 1KHz sound signal...
-        delay(1000);        // ...for 1 sec
-        noTone(6);     // Stop sound...
-      }   
     }
   }
-  delay(500);
+  myFlightData.close();
+  if(settled){
+    while(1) {
+      //-----------------------Beeping sound----------------------------------------
+      tone(6, 1000); // Send 1KHz sound signal...
+      delay(1000);        // ...for 1 sec
+      noTone(6);     // Stop sound...
+    }   
+  }
+  delay(BNO055_SAMPLERATE_DELAY_MS);
 }
